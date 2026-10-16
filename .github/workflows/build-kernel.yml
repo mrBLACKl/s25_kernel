@@ -1,0 +1,250 @@
+name: Build Samsung S25 (SM-S931B) Kernel (KernelSU-Next + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Kernel Version Name'
+        required: true
+        default: 'S931BXXSBCZG3'
+      variant:
+        description: 'Build variant (user or userdebug)'
+        required: true
+        default: 'user'
+      spl_bypass:
+        description: 'Set Security Patch Level to 2099-12 (anti-rollback bypass)'
+        required: true
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build S25 Kernel & Package Boot (KernelSU-Next + SUSFS)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Free Disk Space & Setup Swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          if [ ! -f /swapfile ]; then
+            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
+          free -h
+          df -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            dwarves \
+            flex \
+            git \
+            gnupg \
+            libelf-dev \
+            libssl-dev \
+            lz4 \
+            python3 \
+            python-is-python3 \
+            rsync \
+            device-tree-compiler \
+            zip \
+            zlib1g-dev \
+            libncurses-dev \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu \
+            lld \
+            llvm
+
+      - name: Cache Clang Toolchain (clang-r510928)
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: kernel_platform/prebuilts/clang/host/linux-x86/clang-r510928
+          key: clang-r510928-v1
+
+      - name: Setup Prebuilt Clang Toolchain (clang-r510928)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          PREBUILTS_DIR="${GITHUB_WORKSPACE}/kernel_platform/prebuilts"
+          CLANG_DIR="${PREBUILTS_DIR}/clang/host/linux-x86/clang-r510928"
+
+          if [ ! -f "${CLANG_DIR}/bin/clang" ]; then
+            echo "==> Fetching Clang r510928 from Google AOSP..."
+            mkdir -p "${PREBUILTS_DIR}/clang/host/linux-x86"
+            git clone --depth 1 \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+              -b main-kernel-build-2024 \
+              /tmp/aosp_clang
+            mv /tmp/aosp_clang/clang-r510928 "${PREBUILTS_DIR}/clang/host/linux-x86/"
+            rm -rf /tmp/aosp_clang
+          fi
+
+          echo "==> Clang compiler verification:"
+          "${CLANG_DIR}/bin/clang" --version
+
+      - name: Setup Build Tools & Host Binaries
+        run: |
+          chmod +x "${GITHUB_WORKSPACE}/kernel_platform/build/auto_resolve_tools.py"
+          python3 "${GITHUB_WORKSPACE}/kernel_platform/build/auto_resolve_tools.py"
+
+          # System links for critical tools
+          sudo ln -sf "${GITHUB_WORKSPACE}/kernel_platform/external/avb/avbtool.py" /usr/local/bin/avbtool
+          sudo ln -sf "${GITHUB_WORKSPACE}/kernel_platform/tools/mkbootimg/mkbootimg.py" /usr/local/bin/mkbootimg
+
+          avbtool version
+          echo "==> Host tools verified!"
+
+      - name: Integrate KernelSU-Next & SUSFS
+        run: |
+          set -e
+          COMMON_DIR="${GITHUB_WORKSPACE}/kernel_platform/common"
+          cd "${COMMON_DIR}"
+
+          echo "==> 1. Integrating KernelSU-Next (dev-susfs branch)..."
+          DRIVER_DIR="drivers"
+          git clone --depth 1 -b dev-susfs https://github.com/pershoot/KernelSU-Next.git KernelSU-Next
+          ln -sf "$(realpath --relative-to="${DRIVER_DIR}" "KernelSU-Next/kernel")" "${DRIVER_DIR}/kernelsu"
+
+          # Hook into Makefile and Kconfig
+          grep -q "kernelsu" "${DRIVER_DIR}/Makefile" || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> "${DRIVER_DIR}/Makefile"
+          grep -q "drivers/kernelsu/Kconfig" "${DRIVER_DIR}/Kconfig" || sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' "${DRIVER_DIR}/Kconfig"
+
+          echo "==> 2. Integrating SUSFS kernel source and headers..."
+          cp "${GITHUB_WORKSPACE}/.github/patches/fs/susfs.c" fs/
+          cp -r "${GITHUB_WORKSPACE}/.github/patches/include/linux/"* include/linux/
+
+          echo "==> 3. Applying SUSFS kernel patch..."
+          patch -p1 -F3 -N < "${GITHUB_WORKSPACE}/.github/patches/50_add_susfs_in_gki-android15-6.6.patch" || true
+
+          echo "==> 4. Configuring Kernel Branding & Features..."
+          VERSION_NAME="${{ github.event.inputs.version_name || 'S931BXXSBCZG3' }}"
+          KERNEL_NAME="borani_mrbs-${VERSION_NAME}-Qara"
+          echo "KERNEL_NAME=${KERNEL_NAME}" >> $GITHUB_ENV
+
+          # Update local version in defconfig
+          sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${KERNEL_NAME}\"/" arch/arm64/configs/gki_defconfig || true
+          sed -i "s/printf '%s' -dirty/printf '%s' ''/g" scripts/setlocalversion || true
+          touch .scmversion
+
+          # Append KernelSU & SUSFS configuration flags
+          cat << 'EOF' >> arch/arm64/configs/gki_defconfig
+CONFIG_KSU=y
+CONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_MAP=y
+EOF
+
+          echo "==> Integration complete for ${KERNEL_NAME}!"
+
+      - name: Build GKI Kernel Image
+        run: |
+          set -e
+          COMMON_DIR="${GITHUB_WORKSPACE}/kernel_platform/common"
+          CLANG_DIR="${GITHUB_WORKSPACE}/kernel_platform/prebuilts/clang/host/linux-x86/clang-r510928"
+
+          export PATH="${CLANG_DIR}/bin:$PATH"
+          export ARCH=arm64
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          echo "==> Generating defconfig..."
+          make -C "${COMMON_DIR}" ARCH=arm64 gki_defconfig
+
+          echo "==> Compiling GKI Kernel Image..."
+          make -C "${COMMON_DIR}" ARCH=arm64 -j$(nproc) Image
+
+          ls -lh "${COMMON_DIR}/arch/arm64/boot/Image"
+
+      - name: Package Boot Images & Odin Tar (Samsung S25 Specs)
+        run: |
+          OUTPUT_DIR="${GITHUB_WORKSPACE}/output_boot"
+          mkdir -p "${OUTPUT_DIR}"
+
+          KERNEL_IMG="${GITHUB_WORKSPACE}/kernel_platform/common/arch/arm64/boot/Image"
+          if [ ! -f "${KERNEL_IMG}" ]; then
+            echo "ERROR: Kernel Image not found at ${KERNEL_IMG}"
+            exit 1
+          fi
+
+          echo "Using kernel: ${KERNEL_IMG}"
+          cp "${KERNEL_IMG}" "${OUTPUT_DIR}/Image"
+
+          # Determine security patch level (defaults to 2099-12 bypass)
+          SPL="2026-09"
+          if [ "${{ github.event.inputs.spl_bypass }}" != "false" ]; then
+            SPL="2099-12"
+          fi
+
+          echo "==> Packaging boot.img (Header v4, Pagesize 4096, Android 15, SPL: ${SPL})..."
+          python3 "${GITHUB_WORKSPACE}/kernel_platform/tools/mkbootimg/mkbootimg.py" \
+            --header_version 4 \
+            --kernel "${KERNEL_IMG}" \
+            --pagesize 4096 \
+            --os_version 15.0.0 \
+            --os_patch_level "${SPL}" \
+            --output "${OUTPUT_DIR}/boot.img"
+
+          # Sign with AVB test key using exact Samsung S25 partition size (101122048 bytes)
+          TESTKEY="${GITHUB_WORKSPACE}/kernel_platform/tools/mkbootimg/gki/testdata/testkey_rsa4096.pem"
+          python3 "${GITHUB_WORKSPACE}/kernel_platform/external/avb/avbtool.py" add_hash_footer \
+            --image "${OUTPUT_DIR}/boot.img" \
+            --partition_name boot \
+            --partition_size 101122048 \
+            --key "${TESTKEY}" \
+            --algorithm SHA256_RSA4096
+
+          echo "==> Creating Odin flashable boot.tar (uncompressed boot.img matching device boot_S25.tar)..."
+          (cd "${OUTPUT_DIR}" && tar -H ustar -cvf boot.tar boot.img)
+          cp "${OUTPUT_DIR}/boot.tar" "${OUTPUT_DIR}/${KERNEL_NAME}.tar"
+
+          echo "==> Also creating lz4-compressed boot_lz4.tar..."
+          lz4 -B6 --content-size -f "${OUTPUT_DIR}/boot.img" "${OUTPUT_DIR}/boot.img.lz4"
+          (cd "${OUTPUT_DIR}" && tar -H ustar -cvf boot_lz4.tar boot.img.lz4)
+          rm -f "${OUTPUT_DIR}/boot.img.lz4"
+
+          echo "==> Creating vbmeta_disabled.tar for Samsung AVB verification bypass..."
+          python3 "${GITHUB_WORKSPACE}/kernel_platform/external/avb/avbtool.py" make_vbmeta_image \
+            --flags 2 \
+            --output "${OUTPUT_DIR}/vbmeta.img"
+          lz4 -B6 --content-size -f "${OUTPUT_DIR}/vbmeta.img" "${OUTPUT_DIR}/vbmeta.img.lz4"
+          (cd "${OUTPUT_DIR}" && tar -cvf vbmeta_disabled.tar vbmeta.img.lz4 && rm -f "${OUTPUT_DIR}/vbmeta.img.lz4" "${OUTPUT_DIR}/vbmeta.img")
+
+          ls -lh "${OUTPUT_DIR}"
+
+      - name: Upload Boot & Kernel Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: S25-Kernel-Boot-${{ github.event.inputs.version_name || 'S931BXXSBCZG3' }}
+          path: ${{ github.workspace }}/output_boot/*
+          if-no-files-found: error
