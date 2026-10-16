@@ -142,6 +142,9 @@ jobs:
           KERNEL_NAME="borani_mrbs-${VERSION_NAME}-Qara"
           echo "KERNEL_NAME=${KERNEL_NAME}" >> $GITHUB_ENV
 
+          # Remove Samsung stock localversion file to stay within UTS_RELEASE 64-character limit
+          rm -f localversion*
+
           # Update local version in defconfig
           sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${KERNEL_NAME}\"/" arch/arm64/configs/gki_defconfig || true
           sed -i "s/printf '%s' -dirty/printf '%s' ''/g" scripts/setlocalversion || true
